@@ -35,6 +35,9 @@
 // The --verify brute force is O(huge) -- only use it on small graphs
 // (roughly |L| up to a few hundred, depending on density).
 //
+// Requires GCC or Clang: this file uses __int128 (see the accumulator
+// note below) and <bits/stdc++.h>, neither of which MSVC provides.
+//
 // -----------------------------------------------------------------------
 // ALGORITHM NOTES (why this is correct -- see derivation in chat history)
 //
@@ -66,6 +69,40 @@
 #include <bits/stdc++.h>
 using namespace std;
 typedef long long ll;
+
+// =========================================================================
+// 128-bit accumulator support.
+//
+// The final counts do NOT fit in a signed 64-bit integer on real data:
+// ll tops out at ~9.2e18, while the source paper's own published
+// bi-triangle counts already exceed that on medium datasets (Reuters is
+// ~2.46e19). Worse, the intermediate raw counts Lam/Bar are ~3x the
+// final answer (each bi-triangle is counted three times before the
+// divide-by-3), so they blow past ll even earlier and the overflow is
+// silent -- it shows up as a nonsensical or negative "answer", not a
+// crash.
+//
+// So every accumulator, every C(n,2), and every product of two counts is
+// __int128. The per-vertex maps (S, H, T) stay ll: those hold local
+// wedge/super-wedge counts bounded by the neighbourhood size, which
+// cannot approach 9.2e18. It is only the global sums and the pairwise
+// products fed into them that need the extra width.
+// =========================================================================
+typedef __int128 i128;
+
+static string i128_to_string(i128 n) {
+    if (n == 0) return "0";
+    bool neg = n < 0;
+    unsigned __int128 un = neg ? (unsigned __int128)(-n) : (unsigned __int128)n;
+    string s;
+    while (un > 0) {
+        s += char('0' + (int)(un % 10));
+        un /= 10;
+    }
+    if (neg) s += '-';
+    reverse(s.begin(), s.end());
+    return s;
+}
 
 // =========================================================================
 // Graph storage
@@ -145,16 +182,18 @@ bool loadGraph(const char* path, SignedBiGraph& G) {
 // Signed SWJ-Count
 // =========================================================================
 struct SwjResult {
-    ll balanced = 0;
-    ll unbalanced = 0;
-    ll total() const { return balanced + unbalanced; }
+    i128 balanced = 0;
+    i128 unbalanced = 0;
+    i128 total() const { return balanced + unbalanced; }
 };
 
-static inline ll C2(ll n) { return n > 1 ? n * (n - 1) / 2 : 0; }
+// C(n,2) computed in 128-bit: n is a local count (fits in ll), but n*(n-1)
+// does not -- n ~ 6e9 already overflows a 64-bit product.
+static inline i128 C2(ll n) { return n > 1 ? (i128)n * (n - 1) / 2 : (i128)0; }
 
 SwjResult signedSwjCount(const SignedBiGraph& G) {
-    ll Lam_bal = 0, Lam_unb = 0;   // raw swj-unit counts (valid + both acyclic types mixed in)
-    ll Bar_bal = 0, Bar_unb = 0;   // acyclic corrections (Type-L + Type-U)
+    i128 Lam_bal = 0, Lam_unb = 0; // raw swj-unit counts (valid + both acyclic types mixed in)
+    i128 Bar_bal = 0, Bar_unb = 0; // acyclic corrections (Type-L + Type-U)
 
     // =====================================================================
     // PASS 1: anchor at every l in L.
@@ -193,7 +232,7 @@ SwjResult signedSwjCount(const SignedBiGraph& G) {
             ll ext = (ll)G.degL(x) - 2;
             if (ext > 0) {
                 Bar_bal += (C2(se) + C2(so)) * ext;
-                Bar_unb += (se * so) * ext;
+                Bar_unb += ((i128)se * so) * ext;
             }
         }
 
@@ -247,7 +286,7 @@ SwjResult signedSwjCount(const SignedBiGraph& G) {
             ll he = max(0LL, kv.second.first);
             ll ho = max(0LL, kv.second.second);
             Lam_bal += C2(he) + C2(ho);
-            Lam_unb += he * ho;
+            Lam_unb += (i128)he * ho;
         }
     }
 
@@ -279,7 +318,7 @@ SwjResult signedSwjCount(const SignedBiGraph& G) {
             ll ext = (ll)G.degU(t) - 2;
             if (ext > 0) {
                 Bar_bal += (C2(te) + C2(to)) * ext;
-                Bar_unb += (te * to) * ext;
+                Bar_unb += ((i128)te * to) * ext;
             }
         }
     }
@@ -289,8 +328,8 @@ SwjResult signedSwjCount(const SignedBiGraph& G) {
     // represented by exactly 3 distinct valid swj-units -- one per
     // antipodal (L,U) vertex pair on the 6-cycle).
     // =====================================================================
-    ll balRaw = Lam_bal - Bar_bal;
-    ll unbRaw = Lam_unb - Bar_unb;
+    i128 balRaw = Lam_bal - Bar_bal;
+    i128 unbRaw = Lam_unb - Bar_unb;
 
     SwjResult res;
     res.balanced   = balRaw / 3;
@@ -300,10 +339,12 @@ SwjResult signedSwjCount(const SignedBiGraph& G) {
         res.balanced < 0 || res.unbalanced < 0) {
         cerr << "WARNING: signedSwjCount internal consistency check failed "
              << "(this indicates a bug -- please report).\n";
-        cerr << "  Lam_bal=" << Lam_bal << " Bar_bal=" << Bar_bal
-             << " balRaw=" << balRaw << "\n";
-        cerr << "  Lam_unb=" << Lam_unb << " Bar_unb=" << Bar_unb
-             << " unbRaw=" << unbRaw << "\n";
+        cerr << "  Lam_bal=" << i128_to_string(Lam_bal)
+             << " Bar_bal=" << i128_to_string(Bar_bal)
+             << " balRaw=" << i128_to_string(balRaw) << "\n";
+        cerr << "  Lam_unb=" << i128_to_string(Lam_unb)
+             << " Bar_unb=" << i128_to_string(Bar_unb)
+             << " unbRaw=" << i128_to_string(unbRaw) << "\n";
     }
 
     return res;
@@ -398,9 +439,9 @@ int main(int argc, char** argv) {
     double swjSecs = chrono::duration<double>(t1 - t0).count();
 
     cout << "\n===== Signed SWJ-Count =====\n";
-    cout << "Balanced bi-triangles   : " << res.balanced << "\n";
-    cout << "Unbalanced bi-triangles : " << res.unbalanced << "\n";
-    cout << "Total bi-triangles      : " << res.total() << "\n";
+    cout << "Balanced bi-triangles   : " << i128_to_string(res.balanced) << "\n";
+    cout << "Unbalanced bi-triangles : " << i128_to_string(res.unbalanced) << "\n";
+    cout << "Total bi-triangles      : " << i128_to_string(res.total()) << "\n";
     cout << "Time                    : " << swjSecs << " sec\n";
 
     if (verify) {
@@ -416,20 +457,20 @@ int main(int argc, char** argv) {
         cout << "Total bi-triangles      : " << bf.total << "\n";
         cout << "Time                    : " << bfSecs << " sec\n";
 
-        bool ok = (res.balanced == bf.balanced) &&
-                  (res.unbalanced == bf.unbalanced) &&
-                  (res.total() == bf.total);
+        bool ok = (res.balanced == (i128)bf.balanced) &&
+                  (res.unbalanced == (i128)bf.unbalanced) &&
+                  (res.total() == (i128)bf.total);
 
         cout << "\n===== Comparison =====\n";
         cout << (ok ? "PASS: signed SWJ-Count matches brute force.\n"
                     : "FAIL: signed SWJ-Count DOES NOT match brute force.\n");
         if (!ok) {
             cout << "  balanced   diff (swj - brute): "
-                 << (res.balanced - bf.balanced) << "\n";
+                 << i128_to_string(res.balanced - (i128)bf.balanced) << "\n";
             cout << "  unbalanced diff (swj - brute): "
-                 << (res.unbalanced - bf.unbalanced) << "\n";
+                 << i128_to_string(res.unbalanced - (i128)bf.unbalanced) << "\n";
             cout << "  total      diff (swj - brute): "
-                 << (res.total() - bf.total) << "\n";
+                 << i128_to_string(res.total() - (i128)bf.total) << "\n";
         }
     }
 
