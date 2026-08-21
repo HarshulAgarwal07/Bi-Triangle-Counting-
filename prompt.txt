@@ -1,0 +1,47 @@
+# Chat Summary — Signed Bi-Triangle Counting Project
+
+## Project goal
+Implementing a C++ pipeline for counting **balanced/unbalanced bi-triangles** in **signed bipartite graphs**, building toward an OpenMP-parallelized RSWJ-Count. Based on two papers (both uploaded earlier in this chat):
+- **Yang et al., VLDB 2021** — "Efficient Bi-triangle Counting for Large Bipartite Networks" (unsigned WJ-Count → SWJ-Count → RSWJ-Count).
+- **Mekala et al. 2026** — "Multi-core & GPU-based Balanced Butterfly Counting in Signed Bipartite Graphs" (BB2K bucketing, M-BBC multi-core pattern).
+
+Planned sequence (per standing memory): Phase A (core+rank) → unsigned RSWJ-Count → signed RSWJ-Count → OpenMP. **Actual path taken diverged slightly**: went SWJ-Count (signed, validated) → Phase A (core+rank, validated) → RSWJ-Count derived **directly in signed form** (skipped a separate unsigned-only RSWJ stage) → validated → now mid-way through OpenMP.
+
+## Core mathematical results (all proven, all empirically validated)
+
+**Central lemma** (generalizes BB2K's Lemma 1): if a cycle is formed by joining two edge-disjoint paths sharing both endpoints, the cycle is balanced (even # negative edges) iff the two paths have matching weight (XOR of edge signs). This applies unchanged to 2-edge wedges (butterflies) and 3-edge super-wedges (bi-triangles) — the proof doesn't depend on path length.
+
+**SWJ-Count (signed)**: bi-triangle = join of two super-wedges; 3 representations per bi-triangle → divide by 3 at the end. Two acyclic correction types (Type-L, Type-U), each computed via a separate pass (over L, then over U). Both corrections' balanced/unbalanced split reduces to comparing wedge parity, because the shared "extension edge" cancels under XOR self-cancellation — proven and implemented.
+
+**RSWJ-Count (signed)**: single unified pass over `V = U∪L`, each vertex explores only rank-higher neighbors (Ψ) anchored at its own rank (σ(v)); **unique** representation per bi-triangle (Theorem 3) → **no divide-by-3**. Four acyclic correction lemmas, all derived and implemented:
+- **Type-1.1** (Lemma 2): `Bal += (C(Se,2)+C(So,2))×φ(σ(v),v)`, `Unb += (Se×So)×φ(σ(v),v)`
+- **Type-1.2** (Lemma 3, highest-risk piece — needed a second parity-split accumulator `T_even/T_odd` weighted by `φ(σ(v),x)`): `Bal += Te×(Se-1) + To×(So-1)`, `Unb += Te×So + To×Se`
+- **Type-1.3+Type-2** (Lemma 4, combined): `Bal += (C(Se,2)+C(So,2))×(d(y)-2)`, `Unb += (Se×So)×(d(y)-2)` — same shape as Type-1.1, different multiplier
+- **Self-intersection fix**: same pattern as SWJ — reduces to constant `sign(v,z)`, subtracted `ψ(σ(v),z)` times.
+- **Known assumption flagged**: paper's Algorithm 3 line 11 ("Ψ(φ(v),y)") is almost certainly a typo for **Ψ(σ(v),y)** — implemented on that assumption, and it has since passed validation.
+
+## Files delivered (`/mnt/user-data/outputs/`)
+
+| File | Status |
+|---|---|
+| `signed_swj_count.cpp` | ✅ **Complete, user-validated** (matches brute force exactly). Includes `__int128` overflow protection (ll maxes at ~9.2e18; paper's own datasets exceed that — e.g. Reuters at 2.46e19). Two-pass (L then U), divide-by-3. |
+| `rswj_phase_a.cpp` | ✅ Complete — (2,2)-core peeling, DegRank, Φ/Ψ access, self-checks. Fixed an int32-overflow bug the user found (in the DegRank monotonicity self-check's `nAlive*(nAlive-1)` computation — silently produced a **false PASS** because the loop guard `t<trials` never ran with a negative `trials`). Logic later duplicated into `signed_rswj_count.cpp` directly, so this file is now more historical than load-bearing. |
+| `signed_rswj_count.cpp` | ✅ Phase B core logic **fully validated by user** on small and large graphs (exact match vs brute force) — major milestone, includes the highest-risk Type-1.2 lemma and the line-11 assumption both empirically confirmed. **⚠️ Currently mid-edit for the OpenMP task — see below, file will not compile as-is right now.** |
+
+## ⚠️ Critical: exact in-progress state of `signed_rswj_count.cpp`
+
+Two edits **have been applied**:
+1. `#include <omp.h>` guarded behind `#ifdef _OPENMP` (so the file still builds without `-fopenmp`).
+2. Added a `VertexScratch` struct (`{S, T, H}` maps) right after `SwjResult`, and changed `processVertexL`'s **signature** to take `VertexScratch& scratch`, replacing its local `S`/`T` map declarations with `scratch.S`/`scratch.T` + `.clear()`.
+
+**Edits NOT yet applied (this is why the file won't compile right now):**
+- `processVertexL`'s **H** declaration (further down in the same function) still says `unordered_map<int, pair<ll,ll>> H;` instead of `scratch.H`.
+- `processVertexU` untouched — still has the old 4-arg signature, still declares local `S`/`T`/`H`.
+- Serial `signedRswjCount()` still calls `processVertexL(R, l, Lam_bal, Lam_unb, Bar_bal, Bar_unb)` — **missing the new required `scratch` argument**, and needs one `VertexScratch scratch;` declared once outside its loop, reused (not re-declared) across all vertices.
+- `WorkItem` struct + `buildWorkList()` (fanout-based: `own coreDeg + Σ neighbor coreDeg`, sorted descending, combining L and U into one list) — drafted in conversation but not yet written to the file.
+- `signedRswjCountParallel()` — drafted but not applied. Design: `#pragma omp parallel` region, each thread gets private `i128` locals (since `__int128` has no built-in `omp reduction` support) + its own `VertexScratch`, `#pragma omp for schedule(dynamic, 4)` over the fanout-sorted work list, combined into the 4 global totals via one `#pragma omp critical` per thread at the end (not per-vertex).
+- `main()` — needs rewriting to parse `--verify`, `--cross-check` (new: runs both serial and parallel, diffs them — valuable since brute-force verify only scales to small graphs but this doesn't), `--threads=N`, `--serial`; dispatch to parallel by default.
+- Top-of-file header comment needs updating for `-fopenmp` build instructions and new CLI flags.
+
+## Immediate next step
+Resume the interrupted edit sequence on `signed_rswj_count.cpp`: finish `processVertexL`'s H-scratch swap → apply the same scratch-parameter treatment to `processVertexU` → fix `signedRswjCount()`'s calls to pass a scratch instance → add `WorkItem`/`buildWorkList` → add `signedRswjCountParallel` → rewrite `main()` → update header comments. All exact code for the remaining pieces was already drafted in this conversation and just needs to be applied via the file-editing tool.
