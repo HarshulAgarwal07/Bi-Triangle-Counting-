@@ -1,85 +1,109 @@
-import bz2
 import os
+import bz2
+import pandas as pd
 
-def convert_konect_to_signed_bipartite(
-    input_path="out.digg-votes",
-    output_path="digg_konect_bipartite.txt",
+def streaming_convert_konect(
+    input_path,
+    output_path=None,
     default_sign=0,
-    inject_neg_prob=0.0  # Set > 0 (e.g., 0.25) if you want to generate negative edges for signed stress tests
+    chunk_size=5_000_000  # Processes 5 million rows at a time to stay under ~500MB RAM
 ):
-    """
-    Converts KONECT bipartite datasets (e.g., out.digg-votes) into:
+    if not output_path:
+        base_name = os.path.basename(input_path).replace(".bz2", "")
+        output_path = f"{base_name}_bipartite.txt"
+
+    print(f"🚀 Streaming-parsing KONECT file: {input_path}...")
     
-    Header: nL nU nE
-    Edges:  l u sign (strictly 0-based: l in [0, nL-1], u in [0, nU-1], sign: 0=pos, 1=neg)
+    compression_type = 'bz2' if input_path.endswith(".bz2") else None
+
+    # Global tracking sets for mapping IDs and unique edges without full Pandas dataframes
+    left_mapping = {}
+    right_mapping = {}
+    unique_edges = set()  # Tracks (l, u) to quickly throw away duplicate rows
     
-    Handles plain text, .bz2, and standard KONECT comment headers (%).
-    """
-    import random
+    # Temporary file to store parsed data without holding it in RAM
+    temp_output = output_path + ".tmp"
+    
+    # 1. First Pass: Read in chunks to map IDs and filter duplicate entries
+    chunks = pd.read_csv(
+        input_path, 
+        sep=r'\s+', 
+        comment='%', 
+        header=None, 
+        compression=compression_type,
+        on_bad_lines='skip',
+        chunksize=chunk_size,
+        dtype=str # Keeps IDs uniform as strings to avoid mixed-type bugs
+    )
 
-    is_bz2 = input_path.endswith(".bz2")
-    open_fn = bz2.open if is_bz2 else open
-    mode = "rt" if is_bz2 else "r"
+    total_edges = 0
+    
+    with open(temp_output, "w", encoding="utf-8") as tmp_f:
+        for i, chunk in enumerate(chunks):
+            print(f"   Processing chunk {i + 1}...")
+            
+            # Map columns safely
+            src_col = chunk.iloc[:, 0].values
+            tgt_col = chunk.iloc[:, 1].values
+            
+            # Extract weights if available
+            has_weights = chunk.shape[1] >= 3
+            weights = chunk.iloc[:, 2].values if has_weights else None
 
-    left_to_id = {}    # Left partition (Users)
-    right_to_id = {}   # Right partition (Stories / Items)
-    edges = {}         # (l, u) -> sign
+            for idx in range(len(chunk)):
+                src = src_col[idx]
+                tgt = tgt_col[idx]
+                
+                # Assign 0-based contiguous IDs using fast dictionary lookups
+                if src not in left_mapping:
+                    left_mapping[src] = len(left_mapping)
+                if tgt not in right_mapping:
+                    right_mapping[tgt] = len(right_mapping)
+                    
+                l = left_mapping[src]
+                u = right_mapping[tgt]
+                
+                # Instantly drop duplicates using Python's highly optimized hash sets
+                if (l, u) in unique_edges:
+                    continue
+                unique_edges.add((l, u))
+                
+                # Parse sign
+                sign = default_sign
+                if has_weights and weights[idx]:
+                    try:
+                        sign = 0 if float(weights[idx]) > 0 else 1
+                    except ValueError:
+                        pass
+                
+                # Stream directly to the temporary file
+                tmp_f.write(f"{l} {u} {sign}\n")
+                total_edges += 1
 
-    print(f"Parsing KONECT file: {input_path}...")
-    with open_fn(input_path, mode, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            # Skip KONECT comments and metadata headers
-            if not line or line.startswith("%"):
-                continue
-
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-
-            src = parts[0]
-            tgt = parts[1]
-
-            # Re-map vertex identifiers to strict contiguous 0-based indices
-            if src not in left_to_id:
-                left_to_id[src] = len(left_to_id)
-            if tgt not in right_to_id:
-                right_to_id[tgt] = len(right_to_id)
-
-            l = left_to_id[src]
-            u = right_to_id[tgt]
-
-            # If the dataset has a signed rating column (column 3):
-            if len(parts) >= 3 and parts[2] not in ("1", "0") and not parts[2].isdigit():
-                try:
-                    weight = float(parts[2])
-                    sign = 0 if weight > 0 else 1
-                except ValueError:
-                    sign = default_sign
-            else:
-                if inject_neg_prob > 0.0:
-                    sign = 1 if random.random() < inject_neg_prob else 0
-                else:
-                    sign = default_sign
-
-            edges[(l, u)] = sign
-
-    nL = len(left_to_id)
-    nU = len(right_to_id)
-    nE = len(edges)
-
-    print(f"Writing {nE:,} edges to {output_path} (nL={nL:,}, nU={nU:,})...")
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"{nL} {nU} {nE}\n")
-        for (l, u), s in edges.items():
-            f.write(f"{l} {u} {s}\n")
-
-    print(f"Finished. Graph saved: {nL} left nodes, {nU} right nodes, {nE} edges.")
+    nL = len(left_mapping)
+    nU = len(right_mapping)
+    
+    print(f"💾 Finalising file generation. Writing {total_edges:,} edges...")
+    
+    # 2. Final Pass: Prepend the required header row and append the data stream
+    with open(output_path, "w", encoding="utf-8") as out_f:
+        out_f.write(f"{nL} {nU} {total_edges}\n")
+        
+        # Stream from temp file to final destination to avoid memory usage
+        with open(temp_output, "r", encoding="utf-8") as tmp_f:
+            for line in tmp_f:
+                out_f.write(line)
+                
+    # Clean up the temporary scratch file
+    if os.path.exists(temp_output):
+        os.remove(temp_output)
+        
+    print(f"✨ Finished successfully! Saved to: {output_path}\n")
 
 
 if __name__ == "__main__":
-    # Point this to your uncompressed 'out.digg-votes' or compressed 'digg-votes.tar.bz2' / 'out.digg-votes.bz2'
-    convert_konect_to_signed_bipartite(
-        input_path="out.epinions",
-        output_path="epinions_converted.txt"
+    # Supply any target file name or path dynamically
+    streaming_convert_konect(
+        input_path="out.twitter", 
+        output_path="twitter.txt"
     )
