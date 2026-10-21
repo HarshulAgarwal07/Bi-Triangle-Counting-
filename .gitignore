@@ -1,2 +1,5 @@
 Test_Graphs/
 .DS_Store
+*.txt
+*.md
+!README.md
