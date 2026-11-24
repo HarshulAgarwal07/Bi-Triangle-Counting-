@@ -1,5 +1,10 @@
 Test_Graphs/
+experiments/
+results/
 .DS_Store
 *.txt
 *.md
+*.log
+*.zip
+*.pdf
 !README.md

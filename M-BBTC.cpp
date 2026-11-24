@@ -55,14 +55,14 @@
 // -----------------------------------------------------------------------
 //
 // BUILD:
-//   g++ -O2 -std=c++17 -fopenmp -o signed_rswj_count_omp signed_rswj_count_omp.cpp
+//   g++ -O3 -std=c++17 -fopenmp -o signed_rswj_count_omp signed_rswj_count_omp.cpp
 //
 // The -fopenmp flag is optional: without it the pragmas are ignored and
 // the program still builds and runs, single-threaded, giving identical
 // results (omp.h is included behind #ifdef _OPENMP for exactly this
 // reason). On macOS with Apple Clang, -fopenmp needs libomp:
 //   brew install libomp
-//   clang++ -O2 -std=c++17 -Xpreprocessor -fopenmp -lomp -o signed_rswj_count_omp signed_rswj_count_omp.cpp
+//   clang++ -O3 -std=c++17 -Xpreprocessor -fopenmp -lomp -o signed_rswj_count_omp signed_rswj_count_omp.cpp
 //
 // USAGE:
 //   ./signed_rswj_count_omp graph.txt                 // parallel (default)
@@ -484,16 +484,29 @@ struct VertexScratch {
     unordered_map<int, pair<ll,ll>> H; // z -> (even,odd) super-wedge counts
 };
 
+// Stage timing totals. In the parallel driver these are accumulated across
+// threads (thread-seconds), not wall-clock phase durations, because stages
+// execute interleaved for different anchor vertices.
+struct StageTimings {
+    double stage1Seconds = 0.0; // 2-hop wedge accumulation
+    double stage2Seconds = 0.0; // degenerate tailed-butterfly correction
+    double stage3Seconds = 0.0; // 3-hop super-wedge expansion
+    double stage4Seconds = 0.0; // self-intersection repair
+    double stage5Seconds = 0.0; // join / Lam accumulation
+};
+
 // ---- process one L-anchored vertex v=l ---------------------------------
 // `scratch` is caller-owned and reused across vertices; it is cleared on
 // entry, so callers never need to reset it themselves. It must not be
 // shared between threads.
 void processVertexL(const RankedCoreGraph& R, int l, VertexScratch& scratch,
+                     StageTimings& stageTimes,
                      i128& Lam_bal, i128& Lam_unb, i128& Bar_bal, i128& Bar_unb) {
     int rv = R.rankOfL(l);
     ll phi_v_v = R.phiL(l, rv).size(); // phi(sigma(v),v): v's own neighbors with rank < rv
 
-    // ---- S_even/S_odd (2-hop, y in L) and T_even/T_odd (Lemma 3's weighted sum) ----
+    // ---- Stage 1: 2-hop wedge accumulation ----
+    const auto stage1Start = chrono::steady_clock::now();
     auto& S = scratch.S; // y -> wedge counts AND phi-weighted sums
     S.clear();
 
@@ -509,7 +522,12 @@ void processVertexL(const RankedCoreGraph& R, int l, VertexScratch& scratch,
         }
     }
 
-    // ---- Type-1.1 + Type-1.3/2 (combined) and Type-1.2 corrections ----
+    stageTimes.stage1Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage1Start).count();
+
+    // ---- Stage 2: degenerate tailed-butterfly correction ----
+    const auto stage2Start = chrono::steady_clock::now();
+    // Type-1.1 + Type-1.3/2 (combined) and Type-1.2 corrections
     for (auto& kv : S) {
         int y = kv.first;
         ll se = kv.second.se, so = kv.second.so;
@@ -524,8 +542,11 @@ void processVertexL(const RankedCoreGraph& R, int l, VertexScratch& scratch,
         Bar_bal += (i128)te * (se - 1) + (i128)to * (so - 1);
         Bar_unb += (i128)te * so + (i128)to * se;
     }
+    stageTimes.stage2Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage2Start).count();
 
-    // ---- H_even/H_odd (3-hop, z in U) ----
+    // ---- Stage 3: 3-hop super-wedge expansion ----
+    const auto stage3Start = chrono::steady_clock::now();
     auto& H = scratch.H;
     H.clear();
     for (auto& kv : S) {
@@ -539,7 +560,11 @@ void processVertexL(const RankedCoreGraph& R, int l, VertexScratch& scratch,
         }
     }
 
-    // ---- self-intersection fix ----
+    stageTimes.stage3Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage3Start).count();
+
+    // ---- Stage 4: self-intersection repair ----
+    const auto stage4Start = chrono::steady_clock::now();
     for (int ez : R.adjL[l]) {                    // z in N(v)
         int z = ID(ez), s_lz = SG(ez);
         auto it = H.find(z);
@@ -557,21 +582,30 @@ void processVertexL(const RankedCoreGraph& R, int l, VertexScratch& scratch,
         }
     }
 
-    // ---- accumulate Lam ----
+    stageTimes.stage4Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage4Start).count();
+
+    // ---- Stage 5: join / Lam accumulation ----
+    const auto stage5Start = chrono::steady_clock::now();
     for (auto& kv : H) {
         ll he = max(0LL, kv.second.first);
         ll ho = max(0LL, kv.second.second);
         Lam_bal += C2(he) + C2(ho);
         Lam_unb += (i128)he * ho;
     }
+    stageTimes.stage5Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage5Start).count();
 }
 
 // ---- process one U-anchored vertex v=u (exact mirror, L<->U swapped) ---
 void processVertexU(const RankedCoreGraph& R, int u, VertexScratch& scratch,
+                     StageTimings& stageTimes,
                      i128& Lam_bal, i128& Lam_unb, i128& Bar_bal, i128& Bar_unb) {
     int rv = R.rankOfU(u);
     ll phi_v_v = R.phiU(u, rv).size();
 
+    // ---- Stage 1: 2-hop wedge accumulation ----
+    const auto stage1Start = chrono::steady_clock::now();
     auto& S = scratch.S; // y -> wedge counts AND phi-weighted sums, y in U
     S.clear();
 
@@ -587,6 +621,11 @@ void processVertexU(const RankedCoreGraph& R, int u, VertexScratch& scratch,
         }
     }
 
+    stageTimes.stage1Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage1Start).count();
+
+    // ---- Stage 2: degenerate tailed-butterfly correction ----
+    const auto stage2Start = chrono::steady_clock::now();
     for (auto& kv : S) {
         int y = kv.first;
         ll se = kv.second.se, so = kv.second.so;
@@ -601,7 +640,11 @@ void processVertexU(const RankedCoreGraph& R, int u, VertexScratch& scratch,
         Bar_bal += (i128)te * (se - 1) + (i128)to * (so - 1);
         Bar_unb += (i128)te * so + (i128)to * se;
     }
+    stageTimes.stage2Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage2Start).count();
 
+    // ---- Stage 3: 3-hop super-wedge expansion ----
+    const auto stage3Start = chrono::steady_clock::now();
     auto& H = scratch.H;
     H.clear();
     for (auto& kv : S) {
@@ -615,6 +658,11 @@ void processVertexU(const RankedCoreGraph& R, int u, VertexScratch& scratch,
         }
     }
 
+    stageTimes.stage3Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage3Start).count();
+
+    // ---- Stage 4: self-intersection repair ----
+    const auto stage4Start = chrono::steady_clock::now();
     for (int ez : R.adjU[u]) {                    // z in N(v)
         int z = ID(ez), s_uz = SG(ez);
         auto it = H.find(z);
@@ -632,12 +680,19 @@ void processVertexU(const RankedCoreGraph& R, int u, VertexScratch& scratch,
         }
     }
 
+    stageTimes.stage4Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage4Start).count();
+
+    // ---- Stage 5: join / Lam accumulation ----
+    const auto stage5Start = chrono::steady_clock::now();
     for (auto& kv : H) {
         ll he = max(0LL, kv.second.first);
         ll ho = max(0LL, kv.second.second);
         Lam_bal += C2(he) + C2(ho);
         Lam_unb += (i128)he * ho;
     }
+    stageTimes.stage5Seconds += chrono::duration<double>(
+        chrono::steady_clock::now() - stage5Start).count();
 }
 
 // ---- shared tail, used by both the serial and the parallel driver ------
@@ -662,7 +717,8 @@ static SwjResult finalizeCounts(i128 Lam_bal, i128 Lam_unb,
 }
 
 // ---- serial reference implementation -----------------------------------
-SwjResult signedRswjCount(const RankedCoreGraph& R) {
+SwjResult signedRswjCount(const RankedCoreGraph& R, StageTimings& stageTimes) {
+    stageTimes = {};
     i128 Lam_bal = 0, Lam_unb = 0, Bar_bal = 0, Bar_unb = 0;
 
     // One scratch for the entire run -- declared once here and reused,
@@ -671,11 +727,11 @@ SwjResult signedRswjCount(const RankedCoreGraph& R) {
 
     for (int l = 0; l < R.nL; l++) {
         if (!R.aliveL[l]) continue;
-        processVertexL(R, l, scratch, Lam_bal, Lam_unb, Bar_bal, Bar_unb);
+        processVertexL(R, l, scratch, stageTimes, Lam_bal, Lam_unb, Bar_bal, Bar_unb);
     }
     for (int u = 0; u < R.nU; u++) {
         if (!R.aliveU[u]) continue;
-        processVertexU(R, u, scratch, Lam_bal, Lam_unb, Bar_bal, Bar_unb);
+        processVertexU(R, u, scratch, stageTimes, Lam_bal, Lam_unb, Bar_bal, Bar_unb);
     }
 
     return finalizeCounts(Lam_bal, Lam_unb, Bar_bal, Bar_unb, "signedRswjCount");
@@ -748,7 +804,9 @@ vector<WorkItem> buildWorkList(const RankedCoreGraph& R) {
 // order does not affect the result.
 // =========================================================================
 SwjResult signedRswjCountParallel(const RankedCoreGraph& R,
-                                   const vector<WorkItem>& work) {
+                                   const vector<WorkItem>& work,
+                                   StageTimings& stageTimes) {
+    stageTimes = {};
     i128 Lam_bal = 0, Lam_unb = 0, Bar_bal = 0, Bar_unb = 0;
     const int n = (int)work.size();
 
@@ -757,15 +815,18 @@ SwjResult signedRswjCountParallel(const RankedCoreGraph& R,
         // Thread-private accumulators and scratch. The scratch in
         // particular MUST be private: it is written on every vertex.
         i128 tLam_bal = 0, tLam_unb = 0, tBar_bal = 0, tBar_unb = 0;
+        StageTimings tStageTimes;
         VertexScratch scratch;
 
 #pragma omp for schedule(dynamic, 4) nowait
         for (int i = 0; i < n; i++) {
             const WorkItem& w = work[i];
             if (w.side == 0)
-                processVertexL(R, w.idx, scratch, tLam_bal, tLam_unb, tBar_bal, tBar_unb);
+                processVertexL(R, w.idx, scratch, tStageTimes,
+                               tLam_bal, tLam_unb, tBar_bal, tBar_unb);
             else
-                processVertexU(R, w.idx, scratch, tLam_bal, tLam_unb, tBar_bal, tBar_unb);
+                processVertexU(R, w.idx, scratch, tStageTimes,
+                               tLam_bal, tLam_unb, tBar_bal, tBar_unb);
         }
 
 #pragma omp critical
@@ -774,6 +835,11 @@ SwjResult signedRswjCountParallel(const RankedCoreGraph& R,
             Lam_unb += tLam_unb;
             Bar_bal += tBar_bal;
             Bar_unb += tBar_unb;
+            stageTimes.stage1Seconds += tStageTimes.stage1Seconds;
+            stageTimes.stage2Seconds += tStageTimes.stage2Seconds;
+            stageTimes.stage3Seconds += tStageTimes.stage3Seconds;
+            stageTimes.stage4Seconds += tStageTimes.stage4Seconds;
+            stageTimes.stage5Seconds += tStageTimes.stage5Seconds;
         }
     }
 
@@ -838,6 +904,22 @@ BruteResult bruteForceCount(const RankedCoreGraph& R) {
 // =========================================================================
 // main
 // =========================================================================
+static void printStageTimings(const StageTimings& timings, bool parallelRun) {
+    const char* parallelNote = parallelRun
+        ? " (aggregated across threads; may exceed wall-clock runtime)"
+        : "";
+    cout << "Stage 1 time (2-hop wedge accumulation)" << parallelNote
+         << ": " << timings.stage1Seconds << " sec\n";
+    cout << "Stage 2 time (degenerate tailed-butterfly correction)" << parallelNote
+         << ": " << timings.stage2Seconds << " sec\n";
+    cout << "Stage 3 time (3-hop super-wedge expansion)" << parallelNote
+         << ": " << timings.stage3Seconds << " sec\n";
+    cout << "Stage 4 time (self-intersection repair)" << parallelNote
+         << ": " << timings.stage4Seconds << " sec\n";
+    cout << "Stage 5 time (join / Lam accumulation)" << parallelNote
+         << ": " << timings.stage5Seconds << " sec\n";
+}
+
 static void printUsage(const char* prog) {
     cerr << "Usage: " << prog << " <graph_file> [options]\n"
          << "\n"
@@ -907,13 +989,18 @@ int main(int argc, char** argv) {
     cout << "OpenMP        : NOT compiled in (rebuild with -fopenmp)\n";
 #endif
 
+    auto t0 = chrono::high_resolution_clock::now();
     RankedCoreGraph R = computeCore22(G);
+    buildDegRankInPlace(R);
+    auto t1 = chrono::high_resolution_clock::now();
     cout << "\n===== (2,2)-core =====\n";
     cout << "Alive L-vertices : " << R.nAliveL << " / " << G.nL << "\n";
     cout << "Alive U-vertices : " << R.nAliveU << " / " << G.nU << "\n";
     cout << "Core edges       : " << R.coreEdges << " / " << origE << "\n";
+    cout << "(2,2) core peeling and DegRank sorting time       : "
+             << chrono::duration<double>(t1 - t0).count() << " sec\n";
 
-    buildDegRankInPlace(R);
+    
 
     if (!checkRankPermutation(R)) {
         cerr << "FATAL: rank[] is not a valid permutation -- aborting before counting.\n";
@@ -951,10 +1038,11 @@ int main(int argc, char** argv) {
     SwjResult primary;      // the result everything else is compared against
     const char* primaryName = nullptr;
     double parSecs = 0.0, serSecs = 0.0;
+    StageTimings parStageTimes, serStageTimes;
 
     if (!forceSerial) {
         auto t0 = chrono::high_resolution_clock::now();
-        primary = signedRswjCountParallel(R, work);
+        primary = signedRswjCountParallel(R, work, parStageTimes);
         auto t1 = chrono::high_resolution_clock::now();
         parSecs = chrono::duration<double>(t1 - t0).count();
         primaryName = "parallel";
@@ -965,11 +1053,12 @@ int main(int argc, char** argv) {
         cout << "Total bi-triangles      : " << i128_to_string(primary.total()) << "\n";
         cout << "Threads                 : " << maxThreads << "\n";
         cout << "Time                    : " << parSecs << " sec\n";
+        printStageTimings(parStageTimes, true);
     }
 
     if (forceSerial || crossCheck) {
         auto t0 = chrono::high_resolution_clock::now();
-        SwjResult ser = signedRswjCount(R);
+        SwjResult ser = signedRswjCount(R, serStageTimes);
         auto t1 = chrono::high_resolution_clock::now();
         serSecs = chrono::duration<double>(t1 - t0).count();
 
@@ -978,6 +1067,7 @@ int main(int argc, char** argv) {
         cout << "Unbalanced bi-triangles : " << i128_to_string(ser.unbalanced) << "\n";
         cout << "Total bi-triangles      : " << i128_to_string(ser.total()) << "\n";
         cout << "Time                    : " << serSecs << " sec\n";
+        printStageTimings(serStageTimes, false);
 
         if (forceSerial) {
             primary = ser;
